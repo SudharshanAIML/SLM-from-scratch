@@ -4,11 +4,12 @@ import torch
 
 from slm.model.transformer import Transformer
 from slm.tokenizer.simple_tokenizer import SimpleTokenizer
+from slm.tokenizer.sentencepiece_tokenizer import SentencePieceTokenizer
 
 
 def generate_text(
     model: Transformer,
-    tokenizer: SimpleTokenizer,
+    tokenizer: SimpleTokenizer | SentencePieceTokenizer,
     prompt: str,
     max_new_tokens: int = 16,
     temperature: float = 1.0,

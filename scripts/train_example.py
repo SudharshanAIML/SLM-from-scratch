@@ -22,15 +22,26 @@ def main() -> None:
         "The quick brown fox jumps over the lazy dog.",
         "Small language models can be trained from scratch.",
         "Transformer blocks learn patterns from sequential data.",
+        "FineWeb-style datasets are converted into binary shards before training.",
+        "A production pipeline uses packing, EOS tokens, sharding, and memmapped data.",
     ]
     tokenizer.train_from_texts(texts)
 
-    model_config = ModelConfig(vocab_size=len(tokenizer.vocab), hidden_size=128, num_layers=2, num_heads=4, num_kv_heads=2, head_dim=32, intermediate_size=256, max_seq_len=64)
-    train_config = TrainConfig(batch_size=2, max_steps=10, log_every=1, device="cpu")
+    model_config = ModelConfig(
+        vocab_size=len(tokenizer.vocab),
+        hidden_size=192,
+        num_layers=3,
+        num_heads=6,
+        num_kv_heads=2,
+        head_dim=32,
+        intermediate_size=512,
+        max_seq_len=128,
+    )
+    train_config = TrainConfig(batch_size=2, max_steps=20, log_every=1, device="cpu", checkpoint_dir="checkpoints")
 
     model = Transformer(model_config)
     trainer = Trainer(model, train_config, tokenizer)
-    trainer.train(texts, block_size=16)
+    trainer.train(texts, block_size=32)
 
     output_path = Path("checkpoints/model.pt")
     trainer.save(output_path)

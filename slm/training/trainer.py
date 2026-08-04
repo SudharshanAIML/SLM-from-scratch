@@ -11,6 +11,8 @@ from slm.configs.train_config import TrainConfig
 from slm.data.text_dataset import TextDataset
 from slm.model.transformer import Transformer
 from slm.tokenizer.simple_tokenizer import SimpleTokenizer
+from slm.training.checkpoint import CheckpointManager
+from slm.training.logger import TrainingLogger
 
 
 class Trainer:
@@ -20,6 +22,8 @@ class Trainer:
         self.tokenizer = tokenizer
         self.device = torch.device(train_config.device)
         self.model.to(self.device)
+        self.checkpoint_manager = CheckpointManager(train_config.checkpoint_dir)
+        self.logger = TrainingLogger(Path(train_config.checkpoint_dir) / "logs")
 
     def train(self, texts: list[str], block_size: int) -> None:
         dataset = TextDataset(texts, self.tokenizer, block_size)
@@ -38,6 +42,10 @@ class Trainer:
 
             if step % self.train_config.log_every == 0:
                 print(f"step={step} loss={loss.item():.4f}")
+                self.logger.log({"step": step, "loss": float(loss.item())})
+
+            if (step + 1) % 10 == 0:
+                self.checkpoint_manager.save(self.model, optimizer, step + 1)
 
             if step >= self.train_config.max_steps - 1:
                 break

@@ -636,3 +636,19 @@ The framework will include:
     Support for future extensions like MoE, speculative decoding, long-context scaling, and distributed training
 
 The idea is that, by the end, you'll not only have a trained SLM—you'll understand every tensor, every kernel launch, every optimizer step, every checkpoint file, and every design tradeoff. It will be a framework you can keep extending for years rather than a one-time project.
+
+# Workflow Update
+
+## Completed
+- Built a modular transformer stack with config-driven architecture.
+- Added tokenizer, preprocessing, data, layers, blocks, model, training, inference, and evaluation modules.
+- Added checkpointing and training logging.
+- Added a binary-shard dataset utility for FineWeb-style preprocessing.
+- Added a SentencePiece tokenizer module for a production-style subword path.
+
+## Next recommended steps
+1. Add a small dataset ingestion script for FineWeb-Edu parquet files.
+2. Add a preprocessing script that converts raw documents into packed binary shards.
+3. Support memmapped training batches from those shards.
+4. Add evaluation metrics and validation split handling.
+5. Scale the model config toward the planned 251M-parameter architecture.
