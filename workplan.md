@@ -29,3 +29,19 @@
 3. Add checkpointing, logging, and evaluation metrics.
 4. Add distributed training and mixed precision support.
 5. Add inference optimizations such as KV-cache and sampling improvements.
+
+# Workflow Update
+
+## Completed
+- Built a modular transformer stack with config-driven architecture.
+- Added tokenizer, preprocessing, data, layers, blocks, model, training, inference, and evaluation modules.
+- Added checkpointing and training logging.
+- Added a binary-shard dataset utility for FineWeb-style preprocessing.
+- Added a SentencePiece tokenizer module for a production-style subword path.
+
+## Next recommended steps
+1. Add a small dataset ingestion script for FineWeb-Edu parquet files. [done]
+2. Add a preprocessing script that converts raw documents into packed binary shards. [done]
+3. Support memmapped training batches from those shards. [in progress]
+4. Add evaluation metrics and validation split handling. [in progress]
+5. Scale the model config toward the planned 251M-parameter architecture. [planned]
