@@ -25,6 +25,8 @@ class SimpleTokenizer:
 
     def _add_token(self, token: str) -> None:
         if token not in self.vocab:
+            if self.config.vocab_size and len(self.vocab) >= self.config.vocab_size:
+                return
             self.vocab[token] = len(self.inverse_vocab)
             self.inverse_vocab.append(token)
 
@@ -70,7 +72,7 @@ class SimpleTokenizer:
     @classmethod
     def load(cls, path: str | Path) -> "SimpleTokenizer":
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
-        tokenizer = cls(TokenizeConfig.from_dict(payload["config"]))
+        tokenizer = cls(TokenizerConfig.from_dict(payload["config"]))
         tokenizer.vocab = payload["vocab"]
         tokenizer.inverse_vocab = payload["inverse_vocab"]
         return tokenizer

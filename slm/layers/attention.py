@@ -34,17 +34,13 @@ class MultiHeadAttention(nn.Module):
         k = self._reshape(k, self.num_kv_heads)
         v = self._reshape(v, self.num_kv_heads)
 
-        if kv_cache is not None:
+        use_cache = kv_cache is not None
+        if use_cache:
             past_k = kv_cache.get("k")
             past_v = kv_cache.get("v")
             if past_k is not None and past_v is not None:
                 k = torch.cat([past_k, k], dim=2)
                 v = torch.cat([past_v, v], dim=2)
-            else:
-                kv_cache["k"] = k
-                kv_cache["v"] = v
-        else:
-            kv_cache = {"k": k, "v": v}
 
         q = apply_rotary(q, seq_len=q.size(2))
         k = apply_rotary(k, seq_len=k.size(2))
@@ -58,8 +54,11 @@ class MultiHeadAttention(nn.Module):
             q,
             k,
             v,
-            is_causal=True if kv_cache.get("k") is None else False,
+            is_causal=not use_cache,
             dropout_p=0.0,
         )
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch, seq_len, self.hidden_size)
+        if use_cache:
+            kv_cache["k"] = k
+            kv_cache["v"] = v
         return self.out_proj(attn_output)
