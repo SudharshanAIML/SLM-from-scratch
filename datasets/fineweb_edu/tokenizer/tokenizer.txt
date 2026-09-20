@@ -1,3 +1,0 @@
-The quick brown fox jumps over the lazy dog.
-Small language models can be trained from scratch.
-FineWeb-Edu is a large educational web corpus for language model pretraining.

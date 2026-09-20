@@ -1,9 +1,18 @@
+# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
+*.egg-info/
+.pytest_cache/
+
+# Environments
 .venv/
-checkpoints/
+venv/
+
+# Training artifacts
+checkpoints*/
+datasets/
 *.pt
 *.bin
+*.model
+*.vocab
 *.safetensors
