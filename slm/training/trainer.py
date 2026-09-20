@@ -1,127 +1,218 @@
 from __future__ import annotations
 
+import time
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Optional
 
 import torch
-from torch.utils.data import DataLoader, IterableDataset
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
 
-from slm.configs.model_config import ModelConfig
 from slm.configs.train_config import TrainConfig
-from slm.data.text_dataset import TextDataset
-from slm.model.transformer import Transformer
-from slm.tokenizer.simple_tokenizer import SimpleTokenizer
+from slm.evaluation.evaluator import evaluate
 from slm.training.checkpoint import CheckpointManager
 from slm.training.logger import TrainingLogger
+from slm.training.scheduler import apply_lr, cosine_lr_with_warmup
+
+AMP_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": None}
+
+
+def build_optimizer(model: nn.Module, config: TrainConfig) -> torch.optim.AdamW:
+    """AdamW with weight decay on matmul weights only.
+
+    Norm gains and biases are 1-D and should not be decayed; decaying them
+    pulls the network toward a degenerate scale.
+    """
+    decay, no_decay = [], []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        (decay if param.dim() >= 2 else no_decay).append(param)
+
+    return torch.optim.AdamW(
+        [
+            {"params": decay, "weight_decay": config.weight_decay},
+            {"params": no_decay, "weight_decay": 0.0},
+        ],
+        lr=config.learning_rate,
+        betas=(config.beta1, config.beta2),
+        eps=config.eps,
+    )
 
 
 class Trainer:
+    """Gradient-accumulating trainer with warmup+cosine LR and periodic eval.
+
+    One iteration of the outer loop is exactly one optimizer step, so
+    `global_step`, the LR schedule, checkpoint names and resume all count the
+    same thing.
+    """
+
     def __init__(
         self,
-        model: Transformer,
-        train_config: TrainConfig,
-        tokenizer: SimpleTokenizer | None = None,
+        model: nn.Module,
+        config: TrainConfig,
+        train_dataset,
+        val_dataset=None,
     ) -> None:
-        self.model = model
-        self.train_config = train_config
-        self.tokenizer = tokenizer
-        self.device = torch.device(train_config.device)
-        self.model.to(self.device)
-        self.checkpoint_manager = CheckpointManager(train_config.checkpoint_dir)
-        self.logger = TrainingLogger(Path(train_config.checkpoint_dir) / "logs")
-        self.global_step = 0
+        self.config = config
+        self.device = torch.device(config.resolve_device())
+        self.precision = config.resolve_precision(self.device.type)
+        self.amp_dtype = AMP_DTYPES[self.precision]
 
-    def train_on_texts(self, texts: list[str], block_size: int) -> None:
-        """Train on text dataset."""
-        if self.tokenizer is None:
-            raise ValueError("Tokenizer required for text training")
+        torch.manual_seed(config.seed)
 
-        dataset = TextDataset(texts, self.tokenizer, block_size)
-        loader = DataLoader(dataset, batch_size=self.train_config.batch_size, shuffle=True)
-        self._training_loop(loader)
-
-    def train_on_dataset(self, dataset: IterableDataset) -> None:
-        """Train on iterable dataset (e.g., BinaryShardDataset)."""
-        loader = DataLoader(dataset, batch_size=self.train_config.batch_size)
-        self._training_loop(loader)
-
-    def _training_loop(self, loader: DataLoader) -> None:
-        """Main training loop with gradient accumulation."""
-        optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.train_config.learning_rate,
-            weight_decay=self.train_config.weight_decay,
+        self.model = model.to(self.device)
+        self.optimizer = build_optimizer(self.model, config)
+        self.scaler = torch.amp.GradScaler(
+            self.device.type, enabled=self.precision == "fp16"
         )
 
-        # Try to resume from checkpoint
-        start_step = self._try_resume(optimizer)
-        self.global_step = start_step
+        self.train_dataset = train_dataset
+        self.val_dataset = val_dataset
+        self.train_loader = self._make_loader(train_dataset)
+        self.val_loader = self._make_loader(val_dataset) if val_dataset else None
 
-        accumulated_loss = 0.0
-        num_accumulated = 0
+        self.checkpoints = CheckpointManager(
+            config.checkpoint_dir, keep_last_n=config.keep_last_n_checkpoints
+        )
+        self.logger = TrainingLogger(Path(config.checkpoint_dir) / "logs")
+        self.global_step = 0
 
-        for step, (x, y) in enumerate(loader):
-            if step < start_step:
-                continue
+    def _make_loader(self, dataset) -> DataLoader:
+        return DataLoader(
+            dataset,
+            batch_size=self.config.batch_size,
+            num_workers=self.config.num_workers,
+            pin_memory=self.device.type == "cuda",
+            drop_last=True,
+        )
 
-            x = x.to(self.device)
-            y = y.to(self.device)
+    def _autocast(self):
+        if self.amp_dtype is None:
+            return nullcontext()
+        return torch.autocast(device_type=self.device.type, dtype=self.amp_dtype)
 
-            logits = self.model(x)
-            loss = torch.nn.functional.cross_entropy(
-                logits.view(-1, logits.size(-1)), y.view(-1)
+    # ---------------------------------------------------------------- resume
+
+    def resume(self, path: str | Path | None = None) -> int:
+        """Restore weights, optimizer and step counter from a checkpoint.
+
+        The data stream restarts with a fresh shard shuffle rather than being
+        fast-forwarded: replaying millions of windows to reach an exact
+        position costs more than it is worth for pretraining, and the shards
+        are shuffled every epoch anyway.
+        """
+        self.global_step = self.checkpoints.load(
+            self.model, self.optimizer, path=path, scaler=self.scaler,
+            map_location=str(self.device),
+        )
+        print(f"Resumed from step {self.global_step:,}")
+        return self.global_step
+
+    # ----------------------------------------------------------------- train
+
+    def train(self) -> None:
+        config = self.config
+        self.model.train()
+
+        data_iter = iter(self.train_loader)
+        tokens_per_step = (
+            config.batch_size * config.gradient_accumulation_steps * config.context_length
+        )
+
+        print(
+            f"Training on {self.device} ({self.precision}) | "
+            f"{tokens_per_step:,} tokens/step | "
+            f"steps {self.global_step:,} -> {config.max_steps:,}"
+        )
+
+        start_time = time.time()
+        for step in range(self.global_step, config.max_steps):
+            lr = apply_lr(
+                self.optimizer,
+                cosine_lr_with_warmup(
+                    step,
+                    config.learning_rate,
+                    config.min_learning_rate,
+                    config.warmup_steps,
+                    config.max_steps,
+                ),
             )
 
-            loss_scaled = loss / self.train_config.gradient_accumulation_steps
-            loss_scaled.backward()
+            self.optimizer.zero_grad(set_to_none=True)
+            accumulated = 0.0
 
-            accumulated_loss += loss.item()
-            num_accumulated += 1
+            for _ in range(config.gradient_accumulation_steps):
+                try:
+                    x, y = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(self.train_loader)
+                    x, y = next(data_iter)
 
-            # Gradient accumulation
-            if (step + 1) % self.train_config.gradient_accumulation_steps == 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.train_config.max_grad_norm
+                x = x.to(self.device, non_blocking=True)
+                y = y.to(self.device, non_blocking=True)
+
+                with self._autocast():
+                    logits = self.model(x)
+                    loss = F.cross_entropy(
+                        logits.reshape(-1, logits.size(-1)), y.reshape(-1)
+                    )
+
+                accumulated += loss.item()
+                self.scaler.scale(loss / config.gradient_accumulation_steps).backward()
+
+            # Unscale before clipping so max_grad_norm means the same thing
+            # whether or not fp16 loss scaling is active.
+            self.scaler.unscale_(self.optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), config.max_grad_norm
+            )
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            self.global_step = step + 1
+            avg_loss = accumulated / config.gradient_accumulation_steps
+
+            if self.global_step % config.log_every == 0:
+                elapsed = time.time() - start_time
+                self.logger.log(
+                    {
+                        "step": self.global_step,
+                        "loss": avg_loss,
+                        "lr": lr,
+                        "grad_norm": float(grad_norm),
+                        "tokens_per_sec": tokens_per_step * config.log_every / max(elapsed, 1e-6),
+                    }
                 )
-                optimizer.step()
-                optimizer.zero_grad()
+                start_time = time.time()
 
-                avg_loss = accumulated_loss / num_accumulated
-                self.global_step += 1
+            if self.val_loader and self.global_step % config.eval_every == 0:
+                metrics = evaluate(
+                    self.model,
+                    self.val_loader,
+                    device=self.device,
+                    max_batches=config.eval_steps,
+                    autocast_dtype=self.amp_dtype,
+                )
+                self.logger.log(
+                    {
+                        "step": self.global_step,
+                        "val_loss": metrics["loss"],
+                        "perplexity": metrics["perplexity"],
+                    }
+                )
+                start_time = time.time()
 
-                if self.global_step % self.train_config.log_every == 0:
-                    print(f"step={self.global_step} loss={avg_loss:.4f}")
-                    self.logger.log({"step": self.global_step, "loss": float(avg_loss)})
+            if self.global_step % config.save_every == 0:
+                path = self.checkpoints.save(
+                    self.model, self.optimizer, self.global_step, scaler=self.scaler
+                )
+                print(f"  saved {path.name}")
+                start_time = time.time()
 
-                if self.global_step % self.train_config.save_every == 0:
-                    self.checkpoint_manager.save(self.model, optimizer, self.global_step)
-                    print(f"Saved checkpoint at step {self.global_step}")
-
-                accumulated_loss = 0.0
-                num_accumulated = 0
-
-            if self.global_step >= self.train_config.max_steps:
-                break
-
-        # Save final checkpoint
-        self.checkpoint_manager.save(self.model, optimizer, self.global_step)
-        print(f"Training complete. Final step: {self.global_step}")
-
-    def _try_resume(self, optimizer: torch.optim.Optimizer) -> int:
-        """Try to resume from latest checkpoint."""
-        checkpoint_dir = Path(self.train_config.checkpoint_dir)
-        if not checkpoint_dir.exists():
-            return 0
-
-        checkpoints = sorted(checkpoint_dir.glob("model_step_*.pt"))
-        if not checkpoints:
-            return 0
-
-        latest = checkpoints[-1]
-        try:
-            step = self.checkpoint_manager.load(self.model, optimizer, latest)
-            print(f"Resumed from checkpoint at step {step}")
-            return step
-        except Exception as e:
-            print(f"Failed to resume from checkpoint: {e}")
-            return 0
+        final = self.checkpoints.save(
+            self.model, self.optimizer, self.global_step, scaler=self.scaler
+        )
+        print(f"Training complete at step {self.global_step:,} -> {final.name}")
